@@ -7,11 +7,7 @@ import requests
 
 TB_URL = "http://localhost:8080"
 
-PEOPLE = {
-    "Ellie": "id_val",
-    "Jia": "id_val",
-    "Isabel": "id_val",
-}
+PHONE_PREFIX = "Phone_"
 
 # Libraries are stored under Assets.
 LIBRARY_ENTITY_TYPE = "ASSET"
@@ -68,10 +64,48 @@ def coordinates(lat, lon):
     return lat, lon
 
 
+def get_phone_devices():
+    devices = []
+    page = 0
+
+    while True:
+        result = api(
+            "GET",
+            "/api/tenant/devices",
+            params={"pageSize": 100, "page": page},
+        ).json()
+
+        for device in result.get("data", []):
+            name = device.get("name", "")
+
+            if name.startswith(PHONE_PREFIX):
+                devices.append(device)
+
+        if not result.get("hasNext", False):
+            return devices
+
+        page += 1
+
+
 def get_people():
     people = {}
+    phones = get_phone_devices()
 
-    for name, device_id in PEOPLE.items():
+    if not phones:
+        raise ValueError(
+            f"No phone devices found. Phone device names "
+            f"should start with '{PHONE_PREFIX}'."
+        )
+
+    for device in phones:
+        device_name = device["name"]
+        device_id = device["id"]["id"]
+
+        name = device_name[len(PHONE_PREFIX):].strip()
+
+        if not name:
+            name = device_name
+
         data = api(
             "GET",
             f"/api/plugins/telemetry/DEVICE/{device_id}"
@@ -106,6 +140,20 @@ def get_people():
             )
 
     return people
+
+
+def get_group_center(people):
+    center_lat = (
+        sum(location[0] for location in people.values())
+        / len(people)
+    )
+
+    center_lon = (
+        sum(location[1] for location in people.values())
+        / len(people)
+    )
+
+    return center_lat, center_lon
 
 
 def get_all_library_entities():
@@ -196,7 +244,7 @@ def distance_km(point1, point2):
     return 2 * 6371.0 * math.asin(math.sqrt(value))
 
 
-def rank_libraries(people, libraries):
+def rank_libraries(people, libraries, center):
     for library in libraries:
         location = (library["lat"], library["lon"])
 
@@ -210,11 +258,15 @@ def rank_libraries(people, libraries):
         library["average"] = (
             sum(distances.values()) / len(distances)
         )
+        library["center_distance"] = distance_km(
+            center,
+            location,
+        )
 
     return sorted(
         libraries,
         key=lambda library: (
-            library["maximum"],
+            library["center_distance"],
             library["average"],
             library["name"],
         ),
@@ -240,6 +292,9 @@ def save_results(ranked):
         attributes = {
             "recommended": index == 0,
             "recommendation_rank": index + 1,
+            "center_distance_km": round(
+                library["center_distance"], 3
+            ),
             "max_distance_km": round(library["maximum"], 3),
             "average_distance_km": round(library["average"], 3),
             "recommendation_updated_at": calculated_at,
@@ -261,14 +316,21 @@ def save_results(ranked):
 def main():
     authenticate()
     people = get_people()
+    center = get_group_center(people)
     libraries = get_libraries()
-    ranked = rank_libraries(people, libraries)
+    ranked = rank_libraries(people, libraries, center)
+
+    print(
+        f"\nGroup center: "
+        f"{center[0]:.6f}, {center[1]:.6f}"
+    )
 
     print("\nLibrary ranking (straight-line distance):")
 
     for number, library in enumerate(ranked, 1):
         print(
             f"{number}. {library['name']} | "
+            f"Center: {library['center_distance']:.2f} km | "
             f"Farthest: {library['maximum']:.2f} km | "
             f"Average: {library['average']:.2f} km"
         )
@@ -297,7 +359,7 @@ if __name__ == "__main__":
         status = error.response.status_code
         print(f"\nThingsBoard API error: HTTP {status}")
         print(
-            "Check your tenant login, device IDs, and "
+            "Check your tenant login, phone devices, and "
             "whether libraries are Assets."
         )
         print("If saving failed, fix the issue and rerun.")
